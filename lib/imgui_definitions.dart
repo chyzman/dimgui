@@ -1,8 +1,9 @@
 import 'dart:convert';
 import 'dart:io';
 
-import 'package:imgui_binder/TypeInfo.dart';
 import 'package:imgui_binder/util.dart';
+
+import 'OLD/TypeInfo.dart';
 
 class ImGuiDefinitions {
   late List<EnumDefinition> enums;
@@ -71,7 +72,7 @@ class ImGuiDefinitions {
       val.forEach((o) {
         var ovImGuiName = o["ov_cimguiname"];
         var imguiName = o["cimguiname"];
-        var friendlyName = o["funcname"] == null ? null : camelCase(o["funcname"]);
+        var friendlyName = o["funcname"]?.toString().toCamelCase();
         if (imguiName.endsWith("_destroy")) friendlyName = "destroy";
 
         var typeName = o["stname"];

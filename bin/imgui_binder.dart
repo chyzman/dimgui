@@ -1,74 +1,170 @@
 import 'dart:io';
+import 'dart:ffi';
 
+import 'package:collection/collection.dart';
 import 'package:dart_style/dart_style.dart' show DartFormatter;
 import 'package:imgui_binder/TypeInfo.dart';
 import 'package:imgui_binder/dart_writer.dart';
+import 'package:imgui_binder/ffiNatives.dart';
 import 'package:imgui_binder/imgui_definitions.dart';
 import 'package:imgui_binder/util.dart';
+import 'package:ffi/ffi.dart';
 
-Map<String, SupportedLibrary> libs = {
-  "cimgui": SupportedLibrary(name: "DimGui", classPrefix: "ImGui", dllName: "cimgui", referencesImGui: false),
-  "cimplot": SupportedLibrary(name: "DimPlot", classPrefix: "ImPlot", dllName: "cimplot"),
-  "cimnodes": SupportedLibrary(name: "DimNodes", classPrefix: "ImNodes", dllName: "cimnodes"),
-  "cimguizmo": SupportedLibrary(name: "DimGuizmo", classPrefix: "ImGuizmo", dllName: "cimguizmo"),
-};
-
-SupportedLibrary lib = libs["cimgui"]!;
-ImGuiDefinitions defs = ImGuiDefinitions();
+const String nativeCallsPath = "lib/cimgui.g.dart";
+const String outputDir = "lib/generated";
+const String outputFile = "dimgui";
 
 void main(List<String> args) {
-  if (args.isNotEmpty && libs.containsKey(args[0])) {
-    lib = libs[args[0]]!;
-    print("Generating bindings for ${lib.name}...");
-  } else if (args.isNotEmpty) {
-    print("Unsupported library: ${args[0]}");
-    return;
-  }
-
-  String outputDir = "out";
-  if (args.length > 1) outputDir = args[1];
-
   if (!Directory(outputDir).existsSync()) Directory(outputDir).createSync();
 
-  String defsPath = "resources/definitions/${lib.dllName}";
-  defs.loadFrom(defsPath);
+  print("Parsing ffiGened file...");
+  var natives = FFINatives.fromFile(nativeCallsPath);
+  var defs = ImGuiDefinitions()..loadFrom("resources/definitions/cimgui");
 
-  print("Definitions loaded Successfully!");
   print("Generating bindings...");
 
   var writer = DartWriter();
 
   writer
     ..import("dart:io")
-    ..import("dart:ffi")
+    ..import("dart:ffi", "as ffi")
+    ..writeln()
+    ..import("package:ffi/ffi.dart")
+    ..writeln()
+    ..import("../cimgui.g.dart")
     ..writeln();
 
   generateInitializer(writer);
 
-  generateFunctions(writer);
+  for (var func in natives.functions) {
+    OverloadDefinition? def;
+    bool defaultsStarted = false;
 
-  generateTypes(writer);
+    String fixDefault(String def) {
+      if (wellKnownDefaultValues.containsKey(def)) return wellKnownDefaultValues[def]!;
+      if(num.tryParse(def.substring(0, def.length - 1)) != null) return num.tryParse(def.substring(0, def.length - 1)).toString();
+      return def;
+    }
 
-  generateEnums(writer);
+    //TODO: fix this
+    //pointers with null defaults should be nullable and then have a null check which passes nullptr
+    //also everything else
+    void writeArg(FFIArgument arg, String type) {
+      var isLast = func.arguments.last == arg;
+      String toWrite = arg.name.toCamelCase();
+      var startingBracket = false;
+      var endingBracket = defaultsStarted && isLast;
+      if (def != null && def.defaultValues.containsKey(arg.name)) {
+        var defaultVal = fixDefault(def.defaultValues[arg.name]!);
+        if (defaultVal == "null") {
+          toWrite = "? $toWrite";
+        } else {
+          toWrite = " $toWrite = $defaultVal";
+        }
+        if (!defaultsStarted) startingBracket = true;
+        defaultsStarted = !isLast;
+        if (isLast) endingBracket = true;
+      } else {
+        toWrite = " $toWrite";
+      }
+      toWrite = "${startingBracket ? "[" : ""}$type$toWrite,${endingBracket ? "]" : ""}";
+      writer.writeln(toWrite);
+    }
 
-  File file = File("$outputDir/${camelCase(lib.name)}.g.dart");
+    for (var f in defs.functions) {
+      for (var o in f.overloads) {
+        if (o.exportedName == func.name) {
+          def = o;
+          break;
+        }
+      }
+    }
 
-  print("Formatting output...");
-  var out = writer.content.toString();
-  try {
-    out = DartFormatter().format(out);
-  } catch (e) {
-    print("Failed to format output: $e");
+    if (func.arguments.any((arg) => invalidTypes.contains(arg.type))) {
+      print("Skipping ${func.name} due to invalid type");
+      continue;
+    }
+
+    var preCall = DartWriter();
+    var postCall = DartWriter();
+    var funcName = fixName(func);
+    var funcReturnType = fixReturnType(func);
+
+    writer
+      ..writeln("$funcReturnType $funcName(")
+      ..indent();
+
+    var coerced = List<bool>.filled(func.arguments.length, false);
+
+    for (var (i, arg) in func.arguments.indexed) {
+      var camel = arg.name.toCamelCase();
+      switch (arg.type) {
+        case "ffi.Pointer<ffi.Char>":
+          preCall.writeln("final ${arg.type} _$camel = $camel.toNativeUtf8().cast()");
+          // postCall.writeln("free(_${arg.name});"); how do i free this?
+          writeArg(arg, "String");
+          coerced[i] = true;
+        default:
+          writeArg(arg, arg.type);
+      }
+    }
+
+    var isVoid = funcReturnType == "void";
+
+    writer
+      ..unindent()
+      ..pushBlock(")");
+
+    if (!isVoid) writer.writeln("$funcReturnType ret;");
+
+    writer.writeWriter(preCall);
+
+    writer
+      ..writeln("${isVoid ? "" : "ret = "}_cimgui.${func.name}(")
+      ..indent();
+    for (var (i, arg) in func.arguments.indexed) {
+      writer.writeln("${coerced[i] ? "_" : ""}${arg.name.toCamelCase()},");
+    }
+    writer
+      ..unindent()
+      ..writeln(");")
+      ..writeWriter(postCall);
+
+    if (!isVoid) writer.writeln("return ret;");
+
+    writer
+      ..popBlock()
+      ..writeln();
   }
-  print("Writing to file ${file.path}...");
-  file.writeAsStringSync(out);
+
+  formatAndWrite(writer, "$outputDir/$outputFile.g.dart");
+}
+
+String fixName(FFIFunction func) {
+  var ret = func.name;
+
+  if (ret.startsWith("ig")) {
+    ret = ret.replaceFirst("ig", "");
+  }
+  return ret.toCamelCase();
+}
+
+String fixReturnType(FFIFunction func) {
+  var ret = func.returnType;
+
+  // for (var arg in func.arguments) {
+  //   if (arg.name == "pOut") {
+  //     ret = arg.type;
+  //   }
+  // }
+  return ret;
 }
 
 void generateInitializer(DartWriter writer) {
   print("Generating Initializer...");
   writer
-    ..writeln("//region Init")
-    ..pushBlock("DynamicLibrary initialize${lib.classPrefix}(String path) {")
+    ..beginRegion("Init")
+    ..pushBlock("cImgui _initialize(String path)")
     ..pushBlock("var dll = switch (Platform.operatingSystem)")
     ..writeln('"windows" => "\$path.dll",')
     ..writeln('"macos" => "\$path.dylib",')
@@ -76,242 +172,25 @@ void generateInitializer(DartWriter writer) {
     ..writeln('_ => throw Exception("Unsupported platform \${Platform.operatingSystem}"),')
     ..popBlock(";")
     ..writeln()
-    ..writeln("return DynamicLibrary.open(dll);")
+    ..writeln("return cImgui(ffi.DynamicLibrary.open(dll));")
     ..popBlock()
     ..writeln()
-    ..writeln("final _${lib.dllName} = initialize${lib.classPrefix}();")
-    ..writeln("//endregion")
+    ..writeln('final _cimgui = _initialize("resources/imgui/cimgui");')
+    ..endRegion()
     ..writeln();
   print("");
 }
 
-void generateFunctions(DartWriter writer) {
-  print("Generating Functions...");
-  writer.writeln("//region Functions");
-  for (var func in defs.functions) {
-    print("Generating function: ${func.name}");
+void formatAndWrite(DartWriter writer, String path) {
+  File file = File(path);
 
-    for (var overload in func.overloads) {
-      String exportedName = overload.exportedName;
-      if (exportedName.contains("~")) {
-        continue;
-      }
-      if (exportedName.contains("ImVector_")) {
-        continue;
-      }
-      if (exportedName.contains("ImChunkStream_")) {
-        continue;
-      }
-
-      String ret = getTypeString(overload.returnType, false);
-
-      bool hasVarArg = false;
-      List<String> paramParts = [];
-      List<String> cParamParts = [];
-      List<String> dartParamParts = [];
-      for (int i = 0; i < overload.parameters.length; i++) {
-        var p = overload.parameters[i];
-
-        String pType = getTypeString(p.type, p.isFunctionPointer);
-
-        if (pType == "va_list") {
-          hasVarArg = true;
-          break;
-        }
-
-        if (p.arraySize != 0) pType += "*";
-
-        if (p.name == "...") continue;
-
-        String identifier = identifierReplacements[p.name] ?? p.name;
-        paramParts.add(identifier);
-        cParamParts.add("${isEnum(pType) ? "Uint32" : mapFFIType(pType)} $identifier");
-        dartParamParts.add("${isEnum(pType) ? "int" : mapIntegralType(pType)} $identifier");
-      }
-
-      if (hasVarArg) continue;
-
-      var params = paramParts.join(", ");
-      var cParams = cParamParts.join(", ");
-      var dartParams = dartParamParts.join(", ");
-
-      bool isUdt = exportedName.contains("nonUDT");
-      var methodName = isUdt ? exportedName.substring(0, exportedName.indexOf("_nonUDT")) : exportedName;
-
-      var friendly = camelCase(overload.friendlyName);
-
-      writer
-        ..writeln("///```c")
-        ..writeln("/// $ret $friendly(");
-      for (int j = 0; j < overload.parameters.length; j++) {
-        var p = overload.parameters[j];
-        writer.writeln("///   ${getTypeString(p.type, p.isFunctionPointer)} ${identifierReplacements[p.name] ?? p.name} ${(j == overload.parameters.length - 1 ? "" : ",")}");
-      }
-      writer
-        ..writeln("/// );")
-        ..writeln("///```")
-        ..writeln("${(isEnum(ret) ? "int" : mapIntegralType(ret))} $friendly($dartParams) =>")
-        ..indent()
-        ..writeln("_$methodName($params);")
-        ..unindent()
-        ..writeln()
-        ..writeln("late final _$methodName = _${lib.dllName}.lookupFunction<")
-        ..indent()
-        ..writeln("${(isEnum(ret) ? "Uint32" : mapFFIType(ret))} Function($cParams),")
-        ..writeln("${(isEnum(ret) ? "int" : mapIntegralType(ret))} Function($dartParams)>('$methodName');")
-        ..unindent()
-        ..writeln("");
-    }
+  print("Formatting output...");
+  var out = writer.content.toString();
+  try {
+    // out = DartFormatter().format(out);
+  } catch (e) {
+    print("Failed to format output: $e");
   }
-  writer
-    ..writeln("//endregion")
-    ..writeln();
-  print("");
-}
-
-void generateTypes(DartWriter writer) {
-  print("Generating Types...");
-  writer.writeln("//region Types");
-  for (var typeDef in defs.types) {
-    if (customDefinedTypes.contains(typeDef.name)) {
-      print("Skipping custom defined type: ${typeDef.name}");
-      continue;
-    }
-    print("Generating type: ${typeDef.name}");
-
-    writer.pushBlock("class ${typeDef.name} extends Struct");
-
-    for (var field in typeDef.fields) {
-      String typeString = getTypeString(field.type, field.isFunctionPointer);
-
-      if (field.arraySize != 0) {
-        if (legalFixedTypes.contains(typeString)) {
-          writer
-            ..writeln("@Array(${field.arraySize})")
-            ..writeln("external Array<$typeString> ${field.name};");
-        } else {
-          for (int i = 0; i < field.arraySize; i++) {
-            writer.writeln("external ${mapIntegralType(typeString)} ${camelCase(field.name)}_$i;");
-          }
-        }
-      } else {
-        if (legalFixedTypes.contains(typeString) || typeString == "IntPtr") writer.writeln("@${mapFFIType(typeString)}()");
-
-        if (isEnum(typeString)) {
-          writer
-            ..writeln("/// Enum $typeString")
-            ..writeln("@Uint32()")
-            ..writeln("external int ${camelCase(field.name)};");
-        } else {
-          writer.writeln("external ${mapIntegralType(typeString)} ${camelCase(field.name)};");
-        }
-      }
-      if (field != typeDef.fields.last) writer.writeln();
-    }
-    writer.popBlock();
-  }
-  writer
-    ..writeln("//endregion")
-    ..writeln();
-  print("");
-}
-
-void generateEnums(DartWriter writer) {
-  print("Generating Enums...");
-  writer.writeln("//region Enums");
-  for (var def in defs.enums) {
-    print("Generating enum: ${def.friendlyNames[0]}");
-    writer.pushBlock("class ${def.friendlyNames[0]}");
-    for (var member in def.members) {
-      writer.writeln("const int ${def.sanitizeNames(member.name)} = ${def.sanitizeNames(member.value)};");
-    }
-    writer.popBlock();
-  }
-  writer
-    ..writeln("//endregion")
-    ..writeln();
-  print("");
-}
-
-bool isEnum(String typeString) {
-  return defs.enums.map((x) => x.friendlyNames).any((x) => x.contains(typeString));
-}
-
-String getTypeString(String typeName, bool isFunctionPointer) {
-  int pointerLevel = "*".allMatches(typeName).length;
-
-  String typeString;
-
-  if (!wellKnownTypes.containsKey(typeName)) {
-    if (wellKnownTypes.containsKey(typeName.substring(0, typeName.length - pointerLevel))) {
-      typeString = wellKnownTypes[typeName.substring(0, typeName.length - pointerLevel)]! + "*" * pointerLevel;
-    } else {
-      typeString = typeName;
-      if (isFunctionPointer) typeString = "Pointer";
-    }
-  } else {
-    typeString = wellKnownTypes[typeName]!;
-  }
-
-  return typeString;
-}
-
-String mapIntegralType(String type) {
-  String mappedType = type;
-
-  if (type.endsWith("*")) {
-    var pointerLevel = "*".allMatches(type).length;
-    mappedType = "Pointer<" * pointerLevel + mapFFIType(type.replaceAll("*", "")) + ">" * pointerLevel;
-  } else if (type.toLowerCase().contains("callback")) {
-    mappedType = "Pointer";
-  } else {
-    mappedType = switch (type) {
-      "byte" || "sbyte" || "char" || "ushort" || "short" || "uint" || "int" || "ulong" || "long" || "IntPtr" => "int",
-      "float" || "double" => "double",
-      _ => mappedType,
-    };
-  }
-  return mappedType;
-}
-
-String mapFFIType(String type) {
-  String mappedType = type;
-
-  if (type.endsWith("*")) {
-    var pointerLevel = "*".allMatches(type).length;
-    mappedType = "Pointer<" * pointerLevel + mapFFIType(type.replaceAll("*", "")) + ">" * pointerLevel;
-  } else if (type.toLowerCase().contains("callback")) {
-    mappedType = "Pointer";
-  } else {
-    mappedType = switch (type) {
-      "byte" => "Uint8",
-      "sbyte" => "Int8",
-      "char" => "Uint8",
-      "ushort" => "Uint16",
-      "short" => "Int16",
-      "uint" => "Uint32",
-      "int" => "Int32",
-      "ulong" => "Uint64",
-      "long" => "Int64",
-      "float" => "Float",
-      "double" => "Double",
-      "void" => "Void",
-      _ => mappedType,
-    };
-  }
-  return mappedType;
-}
-
-class SupportedLibrary {
-  String name;
-  bool referencesImGui;
-  String classPrefix;
-  late String dllName;
-
-  SupportedLibrary({
-    required this.name,
-    required this.classPrefix,
-    required this.dllName,
-    this.referencesImGui = true,
-  });
+  print("Writing to file ${file.path}...");
+  file.writeAsStringSync(out);
 }

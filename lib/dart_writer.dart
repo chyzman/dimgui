@@ -35,6 +35,12 @@ class DartWriter {
     }
   }
 
+  void writeWriter(DartWriter writer) {
+    writer.content.toString().split('\n').forEach((line) {
+      writeln(line);
+    });
+  }
+
   void pushBlock(String header) {
     writeln("$header {");
     indent();
@@ -45,7 +51,15 @@ class DartWriter {
     writeln("}${suffix ?? ''}");
   }
 
-  void import(String path) {
-    writeln("import '$path';");
+  void beginRegion(String name) {
+    writeln("// region $name");
+  }
+
+  void endRegion() {
+    writeln("// endregion");
+  }
+
+  void import(String path, [String suffix = ""]) {
+    writeln("import '$path'${suffix.isNotEmpty ? " $suffix" : ""};");
   }
 }
